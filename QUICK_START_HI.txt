@@ -1,0 +1,16 @@
+AJS TRADING PRO — QUICK START (Windows 11)
+
+1) Extract this ZIP to a normal folder, e.g. C:\AJS_TRADING_PRO
+2) Install Node.js 18 or newer from https://nodejs.org/ if not already installed.
+3) Open the extracted folder and double-click START_AJS_TRADING.bat.
+4) First run needs internet to download npm packages.
+5) The launcher creates .env from .env.example. Open .env and add your valid Upstox access token to UPSTOX_ACCESS_TOKEN=...
+6) Restart the app after changing .env.
+7) Open http://localhost:3000 in Chrome.
+
+IMPORTANT
+- Keep the Upstox token private. Never paste it into public/index.html or public/app.js.
+- Live prices/options require valid Upstox API access, correct permissions, market hours, and correct instrument keys.
+- If the token is missing/expired, live values may show WAITING/UNAVAILABLE.
+- Paper trading only. Real order placement is not enabled by this app's paper trading panel.
+- Test B0/B1 confirmation and all colours during market hours before relying on them. This is not financial advice and does not guarantee profit.
