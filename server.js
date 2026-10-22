@@ -11,7 +11,40 @@ const WebSocket = require("ws");
 const protobuf = require("protobufjs");
 const app = express();
 app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
+
+// Resolve the frontend entry point across common layouts. This supports Render
+// deployments where the app is at repo root, in AJS_TRADING_PRO/, or built to
+// dist/ or build/. The selected directory is also served for CSS/JS/assets.
+const FRONTEND_INDEX_CANDIDATES = [
+  path.join(__dirname, "public", "index.html"),
+  path.join(__dirname, "dist", "index.html"),
+  path.join(__dirname, "build", "index.html"),
+  path.join(__dirname, "index.html"),
+  path.join(__dirname, "AJS_TRADING_PRO", "public", "index.html"),
+  path.join(__dirname, "AJS_TRADING_PRO", "dist", "index.html"),
+  path.join(__dirname, "AJS_TRADING_PRO", "build", "index.html"),
+  path.join(__dirname, "AJS_TRADING_PRO", "index.html"),
+  path.join(__dirname, "src", "public", "index.html"),
+  path.join(process.cwd(), "public", "index.html"),
+  path.join(process.cwd(), "dist", "index.html"),
+  path.join(process.cwd(), "build", "index.html"),
+  path.join(process.cwd(), "index.html"),
+  path.join(process.cwd(), "AJS_TRADING_PRO", "public", "index.html"),
+  path.join(process.cwd(), "AJS_TRADING_PRO", "dist", "index.html"),
+  path.join(process.cwd(), "AJS_TRADING_PRO", "build", "index.html"),
+  path.join(process.cwd(), "AJS_TRADING_PRO", "index.html")
+];
+const FRONTEND_INDEX = FRONTEND_INDEX_CANDIDATES.find(file => {
+  try { return fs.statSync(file).isFile(); } catch { return false; }
+}) || null;
+const FRONTEND_DIR = FRONTEND_INDEX ? path.dirname(FRONTEND_INDEX) : null;
+if (FRONTEND_DIR) {
+  console.log(`[AJS_WEB] Frontend index: ${FRONTEND_INDEX}`);
+  app.use(express.static(FRONTEND_DIR));
+} else {
+  console.error("[AJS_WEB] Frontend index.html was not found. Checked:");
+  for (const file of FRONTEND_INDEX_CANDIDATES) console.error(`  - ${file}`);
+}
 
 const PORT = Number(process.env.PORT || 3000);
 const API = "https://api.upstox.com";
@@ -65,7 +98,6 @@ loadSavedInstrumentKeys();
 const paper = { enabled: true, trades: [], nextId: 1 };
 const optionCache = new Map();
 const optionOiSnapshots = new Map();
-const niftyStrikeOiSnapshots = new Map();
 const ALERT_CONFIG_FILE = path.join(__dirname, "alert-config.json");
 let alertPhones = [];
 try { const cfg = JSON.parse(fs.readFileSync(ALERT_CONFIG_FILE, "utf8"));
@@ -513,21 +545,6 @@ app.get("/api/option-chain/:id", async (req,res) => {
       if (Number.isFinite(po) && po>=0) { totalPutOi+=po; putOiCount++; }
     }
     const pcr=(callOiCount && putOiCount && totalCallOi>0)?totalPutOi/totalCallOi:null;
-    // Five-strike window: ATM, two strikes above and two below, with per-strike OI change.
-    const atmIndex = strikes.findIndex(v => v === Number(row.strike_price));
-    const nearbyStrikes = strikes.slice(Math.max(0, atmIndex-2), Math.min(strikes.length, atmIndex+3));
-    const strikeOiRows = nearbyStrikes.map(k => {
-      const r = chainRows.find(x => Number(x.strike_price) === k) || {};
-      const cRaw = r?.call_options?.market_data?.oi, pRaw = r?.put_options?.market_data?.oi;
-      const cOi = cRaw == null || cRaw === '' ? null : Number(cRaw);
-      const pOi = pRaw == null || pRaw === '' ? null : Number(pRaw);
-      const snapKey = `${item.id}|${expiry}|${k}`;
-      const prev = niftyStrikeOiSnapshots.get(snapKey);
-      const cChg = prev && cOi != null && Number.isFinite(cOi) ? cOi-prev.call : null;
-      const pChg = prev && pOi != null && Number.isFinite(pOi) ? pOi-prev.put : null;
-      if ((cOi != null && Number.isFinite(cOi)) || (pOi != null && Number.isFinite(pOi))) niftyStrikeOiSnapshots.set(snapKey,{call:cOi,put:pOi,at:Date.now()});
-      return {strike:k,callOi:Number.isFinite(cOi)?cOi:null,putOi:Number.isFinite(pOi)?pOi:null,callOiChange:cChg,putOiChange:pChg};
-    });
     const previous=optionOiSnapshots.get(item.id);
     const oiChange={
       call: previous && Number.isFinite(call?.oi) && Number.isFinite(previous.call) ? call.oi-previous.call : null,
@@ -541,7 +558,7 @@ app.get("/api/option-chain/:id", async (req,res) => {
     optionCache.set(item.id,{expiry,strike:Number(row.strike_price),call,put,at:Date.now()});
     res.json({underlyingId:item.id,underlyingName:item.name,spot,expiry,strike:Number(row.strike_price),call,put,
       aggregateOi:{call:callOiCount?totalCallOi:null,put:putOiCount?totalPutOi:null,pcr,callRows:callOiCount,putRows:putOiCount},
-      atmOiChange:oiChange,aggregateOiChange,strikeOiRows,source:"Upstox option contract + option chain"});
+      atmOiChange:oiChange,aggregateOiChange,source:"Upstox option contract + option chain"});
   } catch(e) { res.status(e.status||502).json({error:e.message}); }
 });
 
@@ -776,65 +793,17 @@ app.post("/api/paper/close/:id", (req,res) => {
   if(t.status==="OPEN") { t.status="CLOSED"; t.closedAt=new Date().toISOString(); t.exitReason="MANUAL PAPER CLOSE"; t.exitPrice=Number(t.ltp)||Number(t.entry); t.realizedPnl=(t.exitPrice-Number(t.entry))*Number(t.quantity||1); t.pnl=t.realizedPnl; }
   res.json({trade:t,realOrders:false});
 });
-
-// AI stock analysis endpoint. Uses OpenAI when OPENAI_API_KEY is configured;
-// otherwise returns an explainable local analysis without pretending it is generative AI.
-app.post("/api/ai/analyze", async (req, res) => {
-  const body = req.body || {};
-  const symbol = String(body.symbol || "Instrument").slice(0, 80);
-  const question = String(body.question || "").slice(0, 800);
-  const safe = {
-    symbol,
-    ltp: Number.isFinite(Number(body.ltp)) ? Number(body.ltp) : null,
-    timeframe: String(body.timeframe || "15m").slice(0, 10),
-    callScore: Number.isFinite(Number(body.callScore)) ? Number(body.callScore) : null,
-    putScore: Number.isFinite(Number(body.putScore)) ? Number(body.putScore) : null,
-    entrySignal: String(body.entrySignal || "WAIT").slice(0, 30),
-    entryReason: String(body.entryReason || "").slice(0, 300),
-    stopLoss: Number.isFinite(Number(body.stopLoss)) ? Number(body.stopLoss) : null,
-    target: Number.isFinite(Number(body.target)) ? Number(body.target) : null,
-    lastClose: Number.isFinite(Number(body.lastClose)) ? Number(body.lastClose) : null,
-    question
-  };
-  const apiKey = (process.env.OPENAI_API_KEY || "").trim();
-  if (apiKey) {
-    try {
-      const response = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-          instructions: "You are AJS Trading's cautious market-analysis assistant. Explain only from supplied data. Never invent live prices, indicators, OI or news. Distinguish score from probability. Do not guarantee returns. Give: trend read, CALL/PUT score comparison, entry confirmation status, invalidation/risk notes, and WAIT when data is insufficient. Do not tell the user to place an automatic real order. Answer in simple Hindi/Hinglish.",
-          input: JSON.stringify(safe),
-          max_output_tokens: 500
-        })
-      });
-      const data = await response.json();
-      if (!response.ok) return res.status(502).json({ error: data?.error?.message || "AI provider request failed." });
-      const answer = (data.output || []).flatMap(o => o.content || []).filter(c => c.type === "output_text").map(c => c.text).join("\n").trim();
-      return res.json({ mode: "openai", answer: answer || "AI response was empty.", symbol });
-    } catch (e) {
-      return res.status(502).json({ error: "AI service unavailable. Check server internet/API configuration." });
-    }
+// Express 4/5-compatible final fallback (avoid app.get("*") wildcard issues).
+app.use((req, res) => {
+  if (!FRONTEND_INDEX) {
+    return res.status(500).type("text/plain; charset=utf-8").send(
+      "AJS TRADING PRO frontend is missing: index.html was not found. " +
+      "Commit the frontend entry file and set Render Root Directory to the folder containing package.json/server.js. " +
+      "Checked public/, dist/, build/, project root, and common nested project folders."
+    );
   }
-  const c = safe.callScore, p = safe.putScore;
-  let bias = "MIXED / WAIT";
-  if (c !== null && p !== null && c >= p + 15) bias = "CALL SCORE LEAN";
-  else if (c !== null && p !== null && p >= c + 15) bias = "PUT SCORE LEAN";
-  const answer = [
-    `${safe.symbol}: ${bias}.`,
-    `CALL score: ${c === null ? "not available" : c + "/100"}; PUT score: ${p === null ? "not available" : p + "/100"}. Scores are model rules, not win probabilities.`,
-    `5-minute signal: ${safe.entrySignal}${safe.entryReason ? " — " + safe.entryReason : ""}.`,
-    safe.ltp === null ? "Live price is unavailable; do not infer an entry." : `Reported LTP: ${safe.ltp}.`,
-    safe.lastClose === null ? "Completed candle close is unavailable." : `Last completed 5m close: ${safe.lastClose}.`,
-    `Risk levels from current app: SL ${safe.stopLoss === null ? "not available" : safe.stopLoss}; target ${safe.target === null ? "not available" : safe.target}. Verify they match the latest live data before use.`,
-    safe.entrySignal === "WAIT" ? "Decision: WAIT. Do not enter until the app's completed-candle confirmation and risk rules are satisfied." : "Decision: re-check completed-candle confirmation, price location, liquidity and risk before considering any trade.",
-    question ? `Question noted: ${question}. This local fallback can only interpret the supplied fields; configure OPENAI_API_KEY for generative Q&A.` : "For generative explanations and follow-up Q&A, configure OPENAI_API_KEY in the server .env file."
-  ].join("\n\n");
-  return res.json({ mode: "rules_fallback", answer, symbol });
+  return res.sendFile(FRONTEND_INDEX);
 });
-
-app.get("*", (req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
 const httpServer = app.listen(PORT, ()=>{
   console.log(`AJS TRADING PRO running at http://localhost:${PORT}`);
   startMarketWebSocket().catch(err=>console.error("[AJS_WS] Startup error:",err.message));
